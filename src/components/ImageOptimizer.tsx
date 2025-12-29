@@ -1,5 +1,11 @@
-import { createSignal, For, onCleanup, type JSX } from "solid-js";
-import { optimizeImage } from "wasm-image-optimization";
+import { createSignal, For, onCleanup, onMount, type JSX } from "solid-js";
+import {
+  optimizeImage,
+  setLimit,
+  launchWorker,
+  waitReady,
+  close,
+} from "wasm-image-optimization/web-worker";
 
 interface QueueItem {
   id: string;
@@ -15,6 +21,13 @@ type OutputType = "desktop" | "mobile" | "tablet" | "thumbnail" | "logo";
 export default function ImageOptimizer() {
   const [files, setFiles] = createSignal<QueueItem[]>([]);
   const [outputType, setOutputType] = createSignal<OutputType>("desktop");
+
+  // Initialize workers on component mount
+  onMount(async () => {
+    setLimit(8); // Set max concurrent workers (adjust based on CPU cores)
+    await launchWorker(); // Pre-launch workers
+    await waitReady(); // Wait for workers to be ready
+  });
 
   const handleFiles: JSX.EventHandler<HTMLInputElement, Event> = (e) => {
     const newFiles = e.currentTarget.files;
@@ -47,6 +60,19 @@ export default function ImageOptimizer() {
     setFiles([]);
   };
 
+  const downloadImage = (item: QueueItem) => {
+    if (!item.result) return;
+
+    const url = URL.createObjectURL(item.result);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = item.file.name.replace(/\.[^/.]+$/, "") + ".avif";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   const processImage = async (item: QueueItem, preset: OutputType) => {
     const imageData = await item.file.arrayBuffer();
     let width = 0;
@@ -69,6 +95,8 @@ export default function ImageOptimizer() {
         break;
     }
 
+    // Using web-worker version - library handles worker pool automatically
+    // Multiple images process in parallel using library's built-in worker management
     const result = await optimizeImage({
       image: imageData,
       format: "avif",
@@ -81,31 +109,51 @@ export default function ImageOptimizer() {
     return new Blob([result], { type: "image/avif" });
   };
 
-  const processAllImages: JSX.EventHandler<HTMLFormElement, Event> = async () => {
-    for (const item of files()) {
-      setFiles((prev) =>
-        prev.map((f) => (f.id === item.id ? { ...f, status: "processing" as const } : f)),
-      );
+  const processAllImages: JSX.EventHandler<HTMLFormElement, Event> = async (e) => {
+    e.preventDefault();
 
-      try {
+    // Mark all files as processing immediately
+    setFiles((prev) => prev.map((f) => ({ ...f, status: "processing" as const })));
+
+    // Process all images in parallel using Promise.allSettled
+    // (allSettled won't fail if one image fails)
+    const results = await Promise.allSettled(
+      files().map(async (item) => {
         const result = await processImage(item, outputType());
+        return { id: item.id, result };
+      }),
+    );
+
+    // Update status for each image based on results
+    results.forEach((result, index) => {
+      const item = files()[index];
+      if (result.status === "fulfilled") {
         setFiles((prev) =>
           prev.map((f) =>
             f.id === item.id
-              ? { ...f, status: "done" as const, result, resultSize: result.size }
+              ? {
+                ...f,
+                status: "done" as const,
+                result: result.value.result,
+                resultSize: result.value.result.size,
+              }
               : f,
           ),
         );
-      } catch {
+      } else {
         setFiles((prev) =>
           prev.map((f) => (f.id === item.id ? { ...f, status: "error" as const } : f)),
         );
       }
-    }
+    });
   };
 
   onCleanup(() => {
+    // Clean up preview URLs
     files().forEach((f) => URL.revokeObjectURL(f.preview));
+
+    // Close all workers
+    close();
   });
 
   return (
@@ -190,7 +238,16 @@ export default function ImageOptimizer() {
               />
               <button
                 onClick={() => removeFile(item.id)}
-                style={{ position: "absolute", top: "4px", right: "4px" }}
+                style={
+                  item.status !== "pending"
+                    ? { position: "absolute", top: "4px", right: "4px" }
+                    : {
+                      position: "absolute",
+                      top: "50%",
+                      left: "50%",
+                    }
+                }
+                disabled={item.status !== "pending"}
               >
                 ×
               </button>
@@ -203,7 +260,8 @@ export default function ImageOptimizer() {
       <div style={{ display: "flex", "flex-wrap": "wrap", gap: "1rem", "margin-top": "1rem" }}>
         <For each={files()}>
           {(item) =>
-            item.result && (
+            item.result &&
+            item.resultSize && (
               <div style={{ position: "relative" }}>
                 <img
                   src={URL.createObjectURL(item.result)}
@@ -214,13 +272,11 @@ export default function ImageOptimizer() {
                     "object-fit": "cover",
                   }}
                 />
-                <button
-                  onClick={() => removeFile(item.id)}
-                  style={{ position: "absolute", top: "4px", right: "4px" }}
-                >
-                  ×
-                </button>
-                <p>{Math.round(item.file.size / 1024)}kb</p>
+                <p>
+                  {Math.round(item.resultSize / 1024)}kb (-
+                  {Math.round((1 - item.resultSize / item.file.size) * 100)}%)
+                </p>
+                <button onClick={() => downloadImage(item)}>Download</button>
               </div>
             )
           }
